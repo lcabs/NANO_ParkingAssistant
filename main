@@ -1,0 +1,203 @@
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN      2       // Pin connected to the LED strip
+#define NUM_LEDS     30      // Number of LEDs in the strip
+
+#define TRIGGER_PIN  6       // Pin connected to the Trigger pin of the ultrasonic sensor
+#define ECHO_PIN     5       // Pin connected to the Echo pin of the ultrasonic sensor
+
+#define VCC_PIN      7       // Pin connected to VCC of the ultrasonic sensor
+#define GND_PIN      4       // Pin connected to GND of the ultrasonic sensor
+
+#define BUTTON_PIN   3       // Pin connected to the calibration button
+#define BUILTIN_LED  13      // Built-in LED on the Arduino Nano
+
+#define ENABLE_SERIAL_PRINTS true // Set to false to disable serial prints
+
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+const int initialMaxDistance = 100; // Initial maximum distance in cm
+const int initialMinDistance = 10;  // Initial minimum distance in cm
+
+int maxDistance = initialMaxDistance;
+int minDistance = initialMinDistance;
+bool isCalibrating = false;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+const int numSamples = 10;
+int distances[numSamples];
+int index = 0;
+int total = 0;
+float movingAverage = 0;
+int numActiveLEDs = 0;
+String indicatorStatus = "";
+
+void setup() {
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(VCC_PIN, OUTPUT);
+  pinMode(GND_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUILTIN_LED, OUTPUT);
+
+  digitalWrite(VCC_PIN, HIGH);
+  digitalWrite(GND_PIN, LOW);
+
+  strip.begin();
+  strip.show();
+
+  if (ENABLE_SERIAL_PRINTS) {
+    Serial.begin(9600);
+  }
+
+  for (int i = 0; i < numSamples; i++) {
+    distances[i] = 0;
+  }
+}
+
+void loop() {
+  static unsigned long lastPrintTime = 0;
+  static unsigned long lastBlinkTime = 0;
+  static bool ledState = false;
+
+  // Read button state with debounce
+  int buttonState = digitalRead(BUTTON_PIN);
+  if (buttonState == LOW && (millis() - lastDebounceTime) > debounceDelay) {
+    lastDebounceTime = millis();
+    isCalibrating = !isCalibrating;
+
+    if (isCalibrating) {
+      if (ENABLE_SERIAL_PRINTS) {
+        Serial.println("Calibration mode started.");
+      }
+      digitalWrite(BUILTIN_LED, HIGH);
+    } else {
+      if (ENABLE_SERIAL_PRINTS) {
+        Serial.println("Calibration mode ended.");
+      }
+      digitalWrite(BUILTIN_LED, LOW);
+    }
+  }
+
+  // Calibration mode
+  if (isCalibrating) {
+    digitalWrite(TRIGGER_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIGGER_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIGGER_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH);
+    int distance = duration * 0.034 / 2; // Convert to cm
+
+    if (distance < minDistance) {
+      minDistance = distance;
+      if (ENABLE_SERIAL_PRINTS) {
+        Serial.print("New min distance: ");
+        Serial.println(minDistance);
+      }
+    }
+    if (distance > maxDistance) {
+      maxDistance = distance;
+      if (ENABLE_SERIAL_PRINTS) {
+        Serial.print("New max distance: ");
+        Serial.println(maxDistance);
+      }
+    }
+
+    // Blink the built-in LED to indicate calibration is active
+    if (millis() - lastBlinkTime > 500) {
+      lastBlinkTime = millis();
+      ledState = !ledState;
+      digitalWrite(BUILTIN_LED, ledState);
+    }
+
+    return; // Skip the rest of the loop
+  }
+
+  // Measurement mode
+  digitalWrite(TRIGGER_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  int distance = duration * 0.034 / 2; // Convert to cm
+
+  // Update moving average
+  total -= distances[index];
+  distances[index] = distance;
+  total += distance;
+  index = (index + 1) % numSamples;
+  movingAverage = total / float(numSamples);
+
+  // Determine the number of active LEDs and indicator status
+  if (distance < minDistance) {
+    showColor(strip.Color(255, 0, 0), true); // Blinking red for too close
+    numActiveLEDs = NUM_LEDS;
+    indicatorStatus = "Blinking Red (Too Close)";
+  } else if (distance >= minDistance && distance <= maxDistance) {
+    numActiveLEDs = map(distance, minDistance, maxDistance, NUM_LEDS, 1);
+    showColor(getColorForDistance(distance), false);
+    if (distance < (minDistance + (maxDistance - minDistance) / 3)) {
+      indicatorStatus = "Red (Close)";
+    } else if (distance < (minDistance + 2 * (maxDistance - minDistance) / 3)) {
+      indicatorStatus = "Yellow (Middle Distance)";
+    } else {
+      indicatorStatus = "Green (Far)";
+    }
+  } else {
+    numActiveLEDs = 1;
+    showColor(strip.Color(0, 255, 0), false); // Green for far
+    indicatorStatus = "Green (Far)";
+  }
+
+  // Print distance, moving average, and other info to serial port every 50 ms
+  if (ENABLE_SERIAL_PRINTS && millis() - lastPrintTime > 50) {
+    lastPrintTime = millis();
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.print(" cm, Moving Average: ");
+    Serial.print(movingAverage);
+    Serial.print(" cm, Difference: ");
+    Serial.print(distance - movingAverage);
+    Serial.print(" cm, Active LEDs: ");
+    Serial.print(numActiveLEDs);
+    Serial.print(", Indicator Status: ");
+    Serial.print(indicatorStatus);
+    Serial.print(", Min Distance: ");
+    Serial.print(minDistance);
+    Serial.print(" cm, Max Distance: ");
+    Serial.print(maxDistance);
+    Serial.println(" cm");
+  }
+}
+
+void showColor(uint32_t color, bool blink) {
+  static unsigned long lastBlinkTime = 0;
+  static bool ledState = false;
+
+  if (blink) {
+    if (millis() - lastBlinkTime > 500) {
+      lastBlinkTime = millis();
+      ledState = !ledState;
+      strip.fill(ledState ? color : 0, 0, NUM_LEDS);
+      strip.show();
+    }
+  } else {
+    strip.fill(color, 0, numActiveLEDs);
+    strip.show();
+  }
+}
+
+uint32_t getColorForDistance(int distance) {
+  if (distance < minDistance + (maxDistance - minDistance) / 3) {
+    return strip.Color(255, 0, 0); // Red for close
+  } else if (distance < minDistance + 2 * (maxDistance - minDistance) / 3) {
+    return strip.Color(255, 255, 0); // Yellow for middle distance
+  } else {
+    return strip.Color(0, 255, 0); // Green for far
+  }
+}
